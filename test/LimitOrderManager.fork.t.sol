@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {console2} from "forge-std/console2.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {LimitOrderManager} from "../src/LimitOrderManager.sol";
@@ -51,16 +52,22 @@ interface IUniswapV3PoolSwap {
     ) external returns (int256 amount0, int256 amount1);
 }
 
-/// @notice Fork tests 1-10 against the Base WETH/USDC 0.05% pool.
+/// @notice Fork tests against the Arbitrum One WETH/USDC 0.05% pool, including forced-fill and boundary checks.
 /// @dev WETH is token0 and USDC is token1. Up is the old ask, Down is the old bid, and Both is a
 /// range that closes on either edge. Swaps aim at a sqrt price from TickMath so the tick lands
 /// where the trigger should flip. Payout checks preview the position, roll that back, then compare
 /// balances and the values returned by fill.
 contract LimitOrderManagerForkTest is Test {
-    address internal constant WETH = 0x4200000000000000000000000000000000000006;
-    address internal constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
-    address internal constant FACTORY = 0x33128a8fC17869897dcE68Ed026d694621f6FDfD;
-    address internal constant POSITION_MANAGER = 0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1;
+    /// @dev Arbitrum One WETH. token0 of the fork pool, used by every order and payout check.
+    address internal constant WETH = 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1;
+    /// @dev Arbitrum One native USDC. token1 of the fork pool, used by every order and payout check.
+    address internal constant USDC = 0xaf88d065e77c8cC2239327C5EDb3A432268e5831;
+    /// @dev Canonical Uniswap V3 factory on Arbitrum One. setUp resolves the pool through it.
+    address internal constant FACTORY = 0x1F98431c8aD98523631AE4a59f267346ea31F984;
+    /// @dev Uniswap V3 position manager on Arbitrum One. Mints and burns the order NFTs.
+    address internal constant POSITION_MANAGER = 0xC36442b4a4522E871399CD717aBDD847Ab11FE88;
+    /// @dev WETH/USDC 0.05% pool the UI reads. setUp checks the factory resolves to this address.
+    address internal constant POOL = 0xC6962004f452bE9203591991D15f6b388e09E8D0;
     uint24 internal constant FEE = 500;
     uint256 internal constant BPS = 10_000;
 
@@ -76,9 +83,13 @@ contract LimitOrderManagerForkTest is Test {
 
     int24 internal spacing;
 
-    /// @notice Forks Base and deploys a manager owned by a fresh address.
+    /// @notice Forks Arbitrum One (public node if `ARBITRUM_RPC_URL` is empty; block 0 means latest) and deploys a manager.
     function setUp() public {
-        vm.createSelectFork(vm.envOr("BASE_RPC_URL", string("https://base.publicnode.com")));
+        string memory rpc = vm.envOr("ARBITRUM_RPC_URL", string("https://arbitrum-one-rpc.publicnode.com"));
+        if (bytes(rpc).length == 0) rpc = "https://arbitrum-one-rpc.publicnode.com";
+        uint256 forkBlock = vm.envOr("ARBITRUM_FORK_BLOCK", uint256(0));
+        if (forkBlock == 0) vm.createSelectFork(rpc);
+        else vm.createSelectFork(rpc, forkBlock);
 
         owner = makeAddr("owner");
         treasury = makeAddr("treasury");
@@ -91,6 +102,7 @@ contract LimitOrderManagerForkTest is Test {
         pool = IUniswapV3Factory(FACTORY).getPool(WETH, USDC, FEE);
         spacing = IUniswapV3Pool(pool).tickSpacing();
 
+        assertEq(pool, POOL);
         assertEq(IUniswapV3Pool(pool).token0(), WETH);
         assertGt(spacing, 0);
 
@@ -456,6 +468,96 @@ contract LimitOrderManagerForkTest is Test {
         assertGt(IERC20(WETH).balanceOf(newTreasury) + IERC20(USDC).balanceOf(newTreasury), 0);
     }
 
+    /// @notice Accepts the ETH tip when this contract fills an order.
+    receive() external payable {}
+
+    /// @notice An Up order that was fillable turns back into WETH and is not fillable once price returns.
+    function test_priceReturnBeforeFillRestoresThePosition() public {
+        int24 start = _tick();
+        (int24 lower, int24 upper) = _ticksAbove(1);
+        uint256 id = _create(user, _params(lower, upper, 5 ether, 0, LimitOrderManager.Trigger.Up), 0);
+
+        _movePriceUpTo(upper);
+        assertTrue(manager.isFillable(id));
+        (uint256 crossed0, uint256 crossed1,,) = _previewWithdraw(_order(id).tokenId);
+        assertEq(crossed0, 0);
+        assertGt(crossed1, 0);
+
+        _swapAll(true, TickMath.getSqrtPriceAtTick(start));
+        assertLt(_tick(), lower);
+        assertFalse(manager.isFillable(id));
+        (uint256 back0, uint256 back1,,) = _previewWithdraw(_order(id).tokenId);
+        assertGt(back0, 0);
+        assertEq(back1, 0);
+        assertTrue(_order(id).open);
+    }
+
+    /// @notice Stopping exactly on tickUpper from above leaves all token1, reads as not fillable, and cancel still pays.
+    function test_exactUpperBoundaryHoldsToken1ButIsNotFillable() public {
+        (int24 lower, int24 upper) = _ticksAbove(1);
+        uint256 id = _create(user, _params(lower, upper, 5 ether, 0, LimitOrderManager.Trigger.Up), 0.001 ether);
+
+        _movePriceUpTo(upper + spacing);
+        assertGt(_tick(), upper);
+
+        uint160 limit = TickMath.getSqrtPriceAtTick(upper);
+        _swapAll(true, limit);
+
+        (uint160 sqrtPrice, int24 tick,,,,,) = IUniswapV3Pool(pool).slot0();
+        assertEq(sqrtPrice, limit);
+        assertEq(tick, upper - 1);
+        assertFalse(manager.isFillable(id));
+
+        (uint256 principal0, uint256 principal1,,) = _previewWithdraw(_order(id).tokenId);
+        assertEq(principal0, 0);
+        assertGt(principal1, 0);
+
+        uint256 usdcBefore = IERC20(USDC).balanceOf(user);
+        vm.prank(user);
+        manager.cancelOrder(id, 0, 0, user);
+        assertGt(IERC20(USDC).balanceOf(user), usdcBefore);
+        assertFalse(_order(id).open);
+    }
+
+    /// @notice Logs the attacker's net after buying through an Up order, filling it, and selling back.
+    function test_forcedFillRoundTripLogsAttackerNet() public {
+        int24 start = _tick();
+        (int24 lower, int24 upper) = _ticksAbove(1);
+        uint96 tip = 0.001 ether;
+        uint256 id = _create(user, _params(lower, upper, 1 ether, 0, LimitOrderManager.Trigger.Up), tip);
+
+        // Swap output lands on `swapper`. The attacker is this contract plus that helper.
+        uint256 usdcBefore = IERC20(USDC).balanceOf(address(this)) + IERC20(USDC).balanceOf(address(swapper));
+        uint256 wethBefore = IERC20(WETH).balanceOf(address(this)) + IERC20(WETH).balanceOf(address(swapper));
+        uint256 ethBefore = address(this).balance;
+        uint256 userUsdcBefore = IERC20(USDC).balanceOf(user);
+
+        _movePriceUpTo(upper);
+        assertTrue(manager.isFillable(id));
+        (uint256 keeper0, uint256 keeper1, uint96 returnedTip) = manager.fill(id);
+        _swapAll(true, TickMath.getSqrtPriceAtTick(start));
+
+        int256 netUsdc = int256(IERC20(USDC).balanceOf(address(this)) + IERC20(USDC).balanceOf(address(swapper)))
+            - int256(usdcBefore);
+        int256 netWeth = int256(IERC20(WETH).balanceOf(address(this)) + IERC20(WETH).balanceOf(address(swapper)))
+            - int256(wethBefore);
+
+        assertEq(returnedTip, tip);
+        assertEq(address(this).balance - ethBefore, tip);
+        assertFalse(_order(id).open);
+        assertGt(IERC20(USDC).balanceOf(user), userUsdcBefore);
+
+        console2.log("forced fill start tick", start);
+        console2.log("forced fill tip wei", tip);
+        console2.log("forced fill keeper WETH", keeper0);
+        console2.log("forced fill keeper USDC", keeper1);
+        console2.log("forced fill net USDC");
+        console2.logInt(netUsdc);
+        console2.log("forced fill net WETH");
+        console2.logInt(netWeth);
+        console2.log("forced fill end tick", _tick());
+    }
+
     /// @notice Checks that a straddling mint spends both tokens and refunds the surplus input.
     function _assertStraddle(int24 lower, int24 upper, LimitOrderManager.Trigger trigger) internal {
         uint256 amount0 = 0.2 ether;
@@ -650,6 +752,12 @@ contract LimitOrderManagerForkTest is Test {
         assertGt(targetTick, _tick());
         swapper.swap(pool, address(this), false, 20_000_000e6, TickMath.getSqrtPriceAtTick(targetTick));
         assertGe(_tick(), targetTick);
+    }
+
+    /// @notice Swaps this contract's whole input balance toward `limit`, stopping at that sqrt price.
+    function _swapAll(bool zeroForOne, uint160 limit) internal {
+        address token = zeroForOne ? WETH : USDC;
+        swapper.swap(pool, address(this), zeroForOne, IERC20(token).balanceOf(address(this)), limit);
     }
 
     /// @notice Sells WETH for USDC until the pool tick reaches `targetTick`.

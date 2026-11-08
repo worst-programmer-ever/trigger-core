@@ -11,3 +11,9 @@ remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "forge-std/=lib/forge-std/src/",
 ]
+
+[rpc_endpoints]
+arbitrum = "${ARBITRUM_RPC_URL}"
+
+[etherscan]
+arbitrum = { key = "${ARBISCAN_API_KEY}", chain = 42161 }

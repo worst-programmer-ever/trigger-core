@@ -32,4 +32,7 @@ jobs:
         run: forge build --sizes
 
       - name: Run Forge tests
+        env:
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          ARBITRUM_FORK_BLOCK: ${{ secrets.ARBITRUM_FORK_BLOCK }}
         run: forge test -vvv

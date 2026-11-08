@@ -1,0 +1,28 @@
+---
+description: Keep the changelog, logic docs, and test-coverage notes in sync with every change
+alwaysApply: true
+---
+
+# Project records
+
+On every change in this repo (code, config, or a decision), update the records below in the same change. Skip `node_modules/`, `lib/`, `out/`, `cache/`, and generated files.
+
+## Changelog
+
+Append to `.changelog/CHANGELOG.md`, newest entry first. One markdown file. Each entry has a date, what was done, the decision, and how it was implemented.
+
+```markdown
+## 2026-10-17 — Short title
+
+- Done: what changed.
+- Decision: why this approach.
+- Implementation: files or approach used.
+```
+
+## Logic docs
+
+Keep repo-root `docs/` markdown that explains what the code does and why. Update the page for the area you touched. Link pages from `docs/README.md`.
+
+## Test docs
+
+Coverage notes live in `test/docs/`. For each function or class under test: what is tested, how, and known holes (untested paths, skipped cases). Skip tests under `lib/`.
