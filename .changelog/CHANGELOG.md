@@ -2,6 +2,12 @@
 
 Newest entries first. Each entry records what was done, the decision, and how it was implemented.
 
+## 2026-11-08 — Track docs/ and test/docs/
+
+- Done: the hand-written `docs/README.md` and `test/docs/README.md` are now committed. They were silently ignored before.
+- Decision: the `docs/` line in `.gitignore` (Foundry's default for `forge doc` output) matched every `docs` folder, including the records the project rule requires. Only `forge doc`'s generated book is ignored now.
+- Implementation: `.gitignore` ignores `/docs/book/` instead of `docs/`.
+
 ## 2026-11-08 — Fork tests on Arbitrum One, boundary, forced-fill, and odd-token tests
 
 - Done:
